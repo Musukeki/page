@@ -1,624 +1,428 @@
-package com.example.p01.dao;
+// ClockServiceImpl.java（重點流程）
+package com.example.p01.service.impl;
 
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.stream.Collectors;
 
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Modifying;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
 
+import com.example.p01.dao.ClockDateDao;
+import com.example.p01.dao.ClockDateMyBatisDao;
+import com.example.p01.dao.HolidayDao;
+import com.example.p01.dto.ClockDateDto;
+import com.example.p01.dto.ClockOffDto;
+import com.example.p01.dto.response.ApiRes;
 import com.example.p01.entity.ClockDate;
-import com.example.p01.entity.ClockDateId;
+import com.example.p01.service.ifs.ClockDateService;
+import com.example.p01.vo.ClockDateVo.*;
+import com.example.p01.vo.headVo.BasicRes;
 
 import jakarta.transaction.Transactional;
 
-public interface ClockDateDao extends JpaRepository<ClockDate, ClockDateId> {
+@Service
+public class ClockServiceImpl implements ClockDateService {
 
-    // Optional<xxx>: 保證不會有 NPE，但要手動處理 isEmpty
-    @Query(value = "select * from clock_date where employee_id = ?1 and work_date = ?2 "//
-            + " order by clock_on ", nativeQuery = true)
-    public List<ClockDate> getSingleClock(String employeeId, LocalDate workDate);
+	@Autowired
+	private ClockDateDao clockDateDao;
 
-    @Query(value = "select * from clock_date", nativeQuery = true)
-    public List<ClockDate> getAllClock();
+	@Autowired
+	private HolidayDao holidayDao;
 
-    @Query(value = "select * from clock_date where employee_id = ?1", nativeQuery = true)
-    public List<ClockDate> getSingleHistoryClock(String employeeId);
+	@Autowired
+	private ClockDateMyBatisDao clockDateMyBatisDao;
 
-    @Query(value = """
-            select ps.shift_work_id
-            from p01.pre_schedule ps
-            join p01.shift_work  sw on sw.shift_work_id = ps.shift_work_id
-            where ps.employee_id = :employeeId
-              and ps.apply_date  = :workDate
-              and ps.is_accept   = 1
-              and timestamp(ps.apply_date, :clockOn) >=
-                    timestamp(ps.apply_date, sw.start_time) - interval 30 minute
-              and timestamp(ps.apply_date, :clockOn) <
-                    case when sw.end_time > sw.start_time
-                           then timestamp(ps.apply_date, sw.end_time)
-                         else timestamp(date_add(ps.apply_date, interval 1 day), sw.end_time)
-                    end
-            order by ps.shift_work_id
-            limit 1
-            """, nativeQuery = true)
-    Integer findShiftClass(@Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("clockOn") LocalTime clockOn);
 
-    @Query(value = """
-            select exists (
-              /* 命中任一已核可班別的容許時窗（含提前 30 分；支援跨日） */
-              select 1
-              from p01.pre_schedule ps
-              join p01.shift_work  sw on sw.shift_work_id = ps.shift_work_id
-              where ps.employee_id   = :employeeId
-                and ps.apply_date    = :workDate
-                and ps.is_accept     = 1
-                and ps.shift_work_id > 0
-                and timestamp(ps.apply_date, :clockOn) >=
-                      timestamp(ps.apply_date, sw.start_time) - interval 30 minute
-                and timestamp(ps.apply_date, :clockOn) <
-                      case
-                        when sw.end_time > sw.start_time
-                          then timestamp(ps.apply_date, sw.end_time)
-                        else
-                          timestamp(date_add(ps.apply_date, interval 1 day), sw.end_time)
-                      end
 
-              union all
+	@Override
+	public BasicRes clockOff2(ClockOffDto dto) throws Exception {
 
-              /* 若是連續班（差 1），命中其中任何一班也算有排班 */
-              select 1
-              from p01.pre_schedule a
-              join p01.pre_schedule b
-                on a.employee_id = b.employee_id
-               and a.apply_date  = b.apply_date
-               and a.is_accept   = 1
-               and b.is_accept   = 1
-               and abs(a.shift_work_id - b.shift_work_id) = 1
-              join p01.shift_work sw1 on sw1.shift_work_id = a.shift_work_id
-              join p01.shift_work sw2 on sw2.shift_work_id = b.shift_work_id
-              where a.employee_id = :employeeId
-                and a.apply_date  = :workDate
-                and (
-                  timestamp(a.apply_date, :clockOn) >=
-                    timestamp(a.apply_date, sw1.start_time) - interval 30 minute
-                  and timestamp(a.apply_date, :clockOn) <
-                    case
-                      when sw1.end_time > sw1.start_time
-                        then timestamp(a.apply_date, sw1.end_time)
-                      else
-                        timestamp(date_add(a.apply_date, interval 1 day), sw1.end_time)
-                    end
-                  or
-                  timestamp(b.apply_date, :clockOn) >=
-                    timestamp(b.apply_date, sw2.start_time) - interval 30 minute
-                  and timestamp(b.apply_date, :clockOn) <
-                    case
-                      when sw2.end_time > sw2.start_time
-                        then timestamp(b.apply_date, sw2.end_time)
-                      else
-                        timestamp(date_add(b.apply_date, interval 1 day), sw2.end_time)
-                    end
-                )
-              limit 1
-            )
-            """, nativeQuery = true)
-    int checkAcceptPre(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("clockOn") LocalTime clockOn);
+		try {
+			// 取該員工的最新一筆資料出來
+			ClockDateDto lastData = clockDateMyBatisDao.selectClockDate(dto.getEmployeeId());
 
-    @Query(value = """
-            select exists (
-              /* case 1：同一班別時段內已經有 clock_on */
-              select 1
-              from p01.pre_schedule ps
-              join p01.shift_work sw on sw.shift_work_id = ps.shift_work_id
-              join p01.clock_date cd on cd.employee_id = ps.employee_id
-                                    and cd.work_date   = ps.apply_date
-              where ps.employee_id   = :employeeId
-                and ps.apply_date    = :workDate
-                and ps.is_accept     = b'1'
-                and ps.shift_work_id > 0
-                and :clockOn >= subtime(sw.start_time, '00:30:00')
-                and :clockOn <  sw.end_time
-                and cd.clock_on >= subtime(sw.start_time, '00:30:00')
-                and cd.clock_on <  sw.end_time
+			// 判斷下班時間有沒有跨日
+			// 如果有跨日 日期減一
+			LocalDate checkDate;
+			if (dto.getClockOff().isAfter(lastData.getClockOn())) {
 
-              union all
+				checkDate = LocalDate.now();
 
-              /* case 2：當天存在連續班（差 1），則當天若已有任何 clock_date，就視為已打 */
-              select 1
-              from p01.clock_date c2
-              where c2.employee_id = :employeeId
-                and c2.work_date   = :workDate
-                and exists (
-                  select 1
-                  from p01.pre_schedule a
-                  join p01.pre_schedule b
-                    on a.employee_id = b.employee_id
-                   and a.apply_date  = b.apply_date
-                   and a.is_accept   = b'1'
-                   and b.is_accept   = b'1'
-                   and abs(a.shift_work_id - b.shift_work_id) = 1
-                  where a.employee_id = :employeeId
-                    and a.apply_date  = :workDate
-                )
-              limit 1
-            )
-            """, nativeQuery = true)
-    int checkExistsOn(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("clockOn") LocalTime clockOn);
+			} else {
 
-    @Query(value = """
-            select exists (
-              select 1
-              from p01.pre_schedule ps
-              join p01.shift_work sw on sw.shift_work_id = ps.shift_work_id
-              join p01.clock_date cd on cd.employee_id = ps.employee_id
-                                    and cd.work_date   = ps.apply_date
-              where ps.employee_id   = :employeeId
-                and ps.apply_date    = :workDate
-                and ps.is_accept     = 1
-                and ps.shift_work_id > 0
-                /* 參數 clockOn 命中此班別的容許時窗（含提前 30 分；跨日） */
-                and timestamp(ps.apply_date, :clockOn) >=
-                      timestamp(ps.apply_date, sw.start_time) - interval 30 minute
-                and timestamp(ps.apply_date, :clockOn) <
-                      case when sw.end_time > sw.start_time
-                             then timestamp(ps.apply_date, sw.end_time)
-                           else timestamp(date_add(ps.apply_date, interval 1 day), sw.end_time)
-                      end
-                /* 已存在的 clock_on 也命中同一個班別視窗（跨日） */
-                and timestamp(ps.apply_date, cd.clock_on) >=
-                      timestamp(ps.apply_date, sw.start_time) - interval 30 minute
-                and timestamp(ps.apply_date, cd.clock_on) <
-                      case when sw.end_time > sw.start_time
-                             then timestamp(ps.apply_date, sw.end_time)
-                           else timestamp(date_add(ps.apply_date, interval 1 day), sw.end_time)
-                      end
-              limit 1
-            )
-            """, nativeQuery = true)
-    int checkExistsOn2(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("clockOn") LocalTime clockOn);
+				checkDate = LocalDate.now().minusDays(1);
 
+			}
+
+			// 檢查打下班卡時，有沒有先打上班的卡
+
+			// 取最新的一筆資料出來 檢查上班打卡日期有沒有符合當下時間
+//			if(lastData.getWorkDate()!=checkDate) {
+//				return new BasicRes(400, "資料庫找不到符合的資料，請先確認是否有忘記打卡");
+//			}
+
+			ClockOffDto anw = new ClockOffDto(dto.getClockOff(), //
+					dto.getScore(), dto.getEmployeeId());
+
+			// 打下班卡紀錄時間 只更新最新的一筆資料
+			clockDateMyBatisDao.clockOff(anw);
+
+			// 更新後重新查一次最新資料
+			lastData = clockDateMyBatisDao.selectClockDate(dto.getEmployeeId());
+
+			double hours;
+			// LocalTime.MAX = 23:59:59.999999999
+			// LocalTime.MIDNIGHT = 00:00
+			if (lastData.getClockOff().isBefore(lastData.getClockOn())) {
+				hours = Duration.between(lastData.getClockOn(), LocalTime.MAX).toMinutes()
+						+ Duration.between(LocalTime.MIDNIGHT, lastData.getClockOff()).toMinutes();
+			} else {
+				hours = Duration.between(lastData.getClockOn(), lastData.getClockOff()).toMinutes();
+			}
+
+			// 計算暫離的時間 
+			double leaveTime;
+			if (lastData.getRestStart() != null && lastData.getRestEnd() != null) {
+				
+				 leaveTime = Duration.between(lastData.getRestStart(), //
+						lastData.getRestEnd()).toMinutes();
+				 
+				 hours = hours-leaveTime;
+			}
+
+			// 向下取整數 例: 2.7->2 -2.7->-3
+			hours = Math.floor(hours / 60.0 * 2) / 2.0;
+
+			anw.setTotalHour(hours);
+			// 計算完工時，返回資料庫
+			clockDateMyBatisDao.clockOff(anw);
+
+		} catch (Exception e) {
+			throw e;
+		}
+
+		return new BasicRes(200, "success");
+	}
+	
+	// ================================================================================
+	
+	// 查詢個別員工當日打卡紀錄
+    @Override
+    public ApiRes<List<ClockDate>> getSingleClock(String employeeId, LocalDate workDate) {
+
+        List<ClockDate> result = clockDateDao.getSingleClock(employeeId, workDate);
+
+        if (result.isEmpty()) {
+            return new ApiRes<>(400, "查無打卡資料", null);
+        }
+
+        for (ClockDate cd : result) {
+
+            Integer cls = clockDateDao.findShiftClass(cd.getEmployeeId(), cd.getWorkDate(), cd.getClockOn());
+            cd.setClazz(cls);
+        }
+
+        return new ApiRes<>(200, "success", result);
+    }
+
+    // 查詢所有員工歷史打卡紀錄
+    @Override
+    public ApiRes<List<ClockDate>> getAllClock() {
+
+        List<ClockDate> result = clockDateDao.getAllClock();
+
+        return new ApiRes<>(200, "success", result);
+    }
+
+    // 查詢個別員工歷史打卡紀錄
+    @Override
+    public ApiRes<List<ClockDate>> getSingleHistoryClock(String employeeId) {
+
+        List<ClockDate> result = clockDateDao.getSingleHistoryClock(employeeId);
+
+        if (result.isEmpty()) {
+            return new ApiRes<>(400, "查無打卡資料", null);
+        }
+        return new ApiRes<>(200, "success", result);
+    }
+
+    // 上班打卡
     @Transactional
-    @Modifying
-    @Query(value = """
-            insert into p01.clock_date (employee_id, work_date, clock_on, has_double)
-            select
-              :employeeId, :workDate, :clockOn,
-              case when exists (
-                select 1 from p01.holiday h
-                where h.holiday_date = :workDate
-                  and h.has_double   = 1
-                  and h.has_workday  = 1
-              ) then b'1' else b'0' end
-            from dual
-            where
-              (
-                /* 連續班（相鄰，差 1）：命中任一班別的容許時窗（含提前 30 分） */
-                exists (
-                  select 1
-                  from p01.pre_schedule a
-                  join p01.pre_schedule b
-                    on a.employee_id = b.employee_id
-                   and a.apply_date  = b.apply_date
-                   and a.is_accept   = 1
-                   and b.is_accept   = 1
-                   and abs(a.shift_work_id - b.shift_work_id) = 1
-                  join p01.shift_work sw1 on sw1.shift_work_id = a.shift_work_id
-                  join p01.shift_work sw2 on sw2.shift_work_id = b.shift_work_id
-                  where a.employee_id = :employeeId
-                    and a.apply_date  = :workDate
-                    and (
-                      (
-                        timestamp(:workDate, :clockOn) >=
-                          timestamp(:workDate, sw1.start_time) - interval 30 minute
-                        and timestamp(:workDate, :clockOn) <
-                          case
-                            when sw1.end_time > sw1.start_time
-                              then timestamp(:workDate, sw1.end_time)
-                            else
-                              timestamp(date_add(:workDate, interval 1 day), sw1.end_time)
-                          end
-                      )
-                      or
-                      (
-                        timestamp(:workDate, :clockOn) >=
-                          timestamp(:workDate, sw2.start_time) - interval 30 minute
-                        and timestamp(:workDate, :clockOn) <
-                          case
-                            when sw2.end_time > sw2.start_time
-                              then timestamp(:workDate, sw2.end_time)
-                            else
-                              timestamp(date_add(:workDate, interval 1 day), sw2.end_time)
-                          end
-                      )
-                    )
-                )
-                or
-                /* 非連續班：命中該班別的容許時窗（含提前 30 分） */
-                exists (
-                  select 1
-                  from p01.pre_schedule ps
-                  join p01.shift_work  sw on sw.shift_work_id = ps.shift_work_id
-                  where ps.employee_id   = :employeeId
-                    and ps.apply_date    = :workDate
-                    and ps.is_accept     = 1
-                    and ps.shift_work_id > 0
-                    and timestamp(:workDate, :clockOn) >=
-                          timestamp(:workDate, sw.start_time) - interval 30 minute
-                    and timestamp(:workDate, :clockOn) <
-                          case
-                            when sw.end_time > sw.start_time
-                              then timestamp(:workDate, sw.end_time)
-                            else
-                              timestamp(date_add(:workDate, interval 1 day), sw.end_time)
-                          end
-                )
-              )
-              /* 防止同一時刻重複打卡（同員工同日同時間） */
-              and not exists (
-                select 1 from p01.clock_date cd
-                where cd.employee_id = :employeeId
-                  and cd.work_date   = :workDate
-                  and cd.clock_on    = :clockOn
-              )
-            limit 1
-            """, nativeQuery = true)
-    int addClockOnWhenNotContinuous(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("clockOn") LocalTime clockOn);
+    @Override
+    public ApiRes<ClockDate> addClockOn(AddClockOnReq req) {
 
-    @Query(value = """
-            select exists (
-            select 1
-            from p01.pre_schedule as a
-            join p01.pre_schedule as b
-            on a.employee_id = b.employee_id
-            and a.apply_date = b.apply_date
-            and a.is_accept = b'1'
-            and b.is_accept = b'1'
-            and abs(a.shift_work_id - b.shift_work_id) = 1
-            where a.employee_id = :employeeId
-            and a.apply_date = :workDate )
-            """, nativeQuery = true)
-    public int hasContinuousShift(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate);
+        boolean hasPre = clockDateDao.checkAcceptPre(req.getEmployeeId(), req.getWorkDate(), req.getClockOn()) == 1;
 
+        if (!hasPre) {
+            return new ApiRes<>(400, "該時段未排班", null);
+        }
+
+        // boolean hasExistsOn = dao.checkExistsOn(req.getEmployeeId(),
+        // req.getWorkDate(), req.getClockOn()) == 1;
+
+        boolean isContinuous = clockDateDao.hasContinuousShift(req.getEmployeeId(), req.getWorkDate()) == 1;
+        if (isContinuous) {
+            boolean hasAnyOnToday = clockDateDao.hasClockOn(req.getEmployeeId(), req.getWorkDate()) == 1;
+            if (hasAnyOnToday) {
+                return new ApiRes<>(400, "該時段已有打卡紀錄", null);
+            }
+        } else {
+            // 非連續班同一班別不可重複
+            boolean hasExistsOn = clockDateDao.checkExistsOn2(
+                    req.getEmployeeId(), req.getWorkDate(), req.getClockOn()) == 1;
+            if (hasExistsOn) {
+                return new ApiRes<>(400, "該時段已有打卡紀錄", null);
+            }
+        }
+
+        int changed = clockDateDao.addClockOnWhenNotContinuous(req.getEmployeeId(), req.getWorkDate(), req.getClockOn());
+
+        if (changed == 1) {
+
+            boolean continuous = clockDateDao.hasContinuousShift(req.getEmployeeId(), req.getWorkDate()) == 1;
+
+            if (continuous) {
+                return new ApiRes<>(200, "打卡成功", null);
+            } else {
+                return new ApiRes<>(200, "打卡成功", null);
+            }
+
+        } else {
+
+            return new ApiRes<>(500, "未知錯誤", null);
+        }
+
+    }
+
+    // 下班打卡
     @Transactional
-    @Modifying
-    @Query(value = """
-            update p01.clock_date as cd
-            set cd.rest_start = :restStart
-            where cd.employee_id = :employeeId
-            and cd.work_date = :workDate
-            and cd.rest_start is null
-            order by cd.clock_on desc
-            limit 1
-            """, nativeQuery = true)
-    public int addRestStart(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("restStart") LocalTime restStart);
+    @Override
+    public ApiRes<ClockDate> addClockOff(AddClockOffReq req) {
 
+        return null;
+    }
+
+    // 休息開始
     @Transactional
-    @Modifying
-    @Query(value = """
-            update p01.clock_date as cd
-            set cd.rest_end = :restEnd
-            where cd.employee_id = :employeeId
-            and cd.work_date = :workDate
-            and cd.rest_start is not null
-            and cd.rest_end is null
-            order by cd.clock_on desc
-            limit 1
-            """, nativeQuery = true)
-    public int addRestEnd(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("restEnd") LocalTime restEnd);
+    @Override
+    public ApiRes<ClockDate> addRestStart(AddRestStartReq req) {
 
-    @Query(value = """
-            select exists (
-            select 1 from p01.clock_date
-            where employee_id = :employeeId
-            and work_date = :workDate
-            and rest_start is not null
-            and rest_end is null)
-            """, nativeQuery = true)
-    public int existsRestStart(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("restStart") LocalTime restStart);
+        boolean continuous = clockDateDao.hasContinuousShift(req.getEmployeeId(), req.getWorkDate()) == 1;
 
-    @Query(value = """
-            select exists (
-            select 1 from p01.clock_date
-            where employee_id = :employeeId
-            and work_date = :workDate
-            and rest_end is not null)
-            """, nativeQuery = true)
-    public int existsRestEnd(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("restEnd") LocalTime restEnd);
+        if (!continuous) {
+            return new ApiRes<>(200, "非連續時段班無法休息", null);
+        }
 
-    @Query(value = """
-            select exists (
-            select 1 from p01.clock_date
-            where employee_id = :employeeId
-            and work_date = :workDate
-            and clock_on is not null)
-            """, nativeQuery = true)
-    public int hasClockOn(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate);
+        boolean checkRangeOfRest = clockDateDao.canStartRest(req.getEmployeeId(), req.getWorkDate(), req.getRestStart()) == 1;
 
-    @Query(value = """
-            select exists (
-            select 1 from p01.clock_date
-            where employee_id = :employeeId
-            and work_date = :workDate
-            and clock_off is not null)
-            """, nativeQuery = true)
-    public int hasClockOff(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate);
+        if (!checkRangeOfRest) {
+            return new ApiRes<>(400, "未在上班時段之間打卡", null);
+        }
 
-    @Query(value = """
-            select exists (
-            select 1 from p01.clock_date
-            where employee_id = :employeeId
-            and work_date = :workDate
-            and clock_on is not null
-            and rest_start is not null)
-            """, nativeQuery = true)
-    public int hasRestStart(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate);
+        boolean hasRestStart = clockDateDao.existsRestStart(req.getEmployeeId(), req.getWorkDate(), req.getRestStart()) == 1;
 
-    @Query(value = """
-            select exists (
-            select 1
-              from p01.pre_schedule a
-              join p01.pre_schedule b
-                on a.employee_id = b.employee_id
-               and a.apply_date  = b.apply_date
-               and a.is_accept   = 1
-               and b.is_accept   = 1
-               and abs(a.shift_work_id - b.shift_work_id) = 1
-              join p01.shift_work sw1 on sw1.shift_work_id = a.shift_work_id
-              join p01.shift_work sw2 on sw2.shift_work_id = b.shift_work_id
-              where a.employee_id = :employeeId
-                and a.apply_date  = :workDate
-                and (
-                  ( timestamp(:workDate, :restStart) >= timestamp(:workDate, sw1.start_time) - interval 30 minute
-                    and timestamp(:workDate, :restStart) <
-                        case when sw1.end_time > sw1.start_time
-                               then timestamp(:workDate, sw1.end_time)
-                             else timestamp(date_add(:workDate, interval 1 day), sw1.end_time)
-                        end )
-                  or
-                  ( timestamp(:workDate, :restStart) >= timestamp(:workDate, sw2.start_time) - interval 30 minute
-                    and timestamp(:workDate, :restStart) <
-                        case when sw2.end_time > sw2.start_time
-                               then timestamp(:workDate, sw2.end_time)
-                             else timestamp(date_add(:workDate, interval 1 day), sw2.end_time)
-                        end )
-                )
-              limit 1
-            )
-            """, nativeQuery = true)
-    int canStartRest(@Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("restStart") LocalTime restStart);
+        if (hasRestStart) {
+            return new ApiRes<>(400, "已有休息開始紀錄", null);
+        }
 
-    @Query(value = """
-            select exists (
-              select 1
-              from p01.pre_schedule a
-              join p01.pre_schedule b
-                on a.employee_id = b.employee_id
-               and a.apply_date  = b.apply_date
-               and a.is_accept   = 1
-               and b.is_accept   = 1
-               and abs(a.shift_work_id - b.shift_work_id) = 1
-              join p01.shift_work sw1 on sw1.shift_work_id = a.shift_work_id
-              join p01.shift_work sw2 on sw2.shift_work_id = b.shift_work_id
-              join p01.clock_date cd
-                on cd.employee_id = a.employee_id
-               and cd.work_date   = a.apply_date
-               and cd.rest_start is not null
-               and cd.rest_end   is null
-              where a.employee_id = :employeeId
-                and a.apply_date  = :workDate
-                and (
-                  ( timestamp(:workDate, :restEnd) >= timestamp(:workDate, sw1.start_time) - interval 30 minute
-                    and timestamp(:workDate, :restEnd) <
-                        case when sw1.end_time > sw1.start_time
-                               then timestamp(:workDate, sw1.end_time)
-                             else timestamp(date_add(:workDate, interval 1 day), sw1.end_time)
-                        end )
-                  or
-                  ( timestamp(:workDate, :restEnd) >= timestamp(:workDate, sw2.start_time) - interval 30 minute
-                    and timestamp(:workDate, :restEnd) <
-                        case when sw2.end_time > sw2.start_time
-                               then timestamp(:workDate, sw2.end_time)
-                             else timestamp(date_add(:workDate, interval 1 day), sw2.end_time)
-                        end )
-                )
-                and (
-                  /* 把 rest_end 轉成正確的日期時間後再跟 rest_start 比（支援跨日） */
-                  case when :restEnd >= cd.rest_start
-                         then timestamp(:workDate, :restEnd)
-                       else timestamp(date_add(:workDate, interval 1 day), :restEnd)
-                  end
-                ) >= timestamp(:workDate, cd.rest_start)
-              limit 1
-            )
-            """, nativeQuery = true)
-    int canEndRest(@Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("restEnd") LocalTime restEnd);
+        boolean row = clockDateDao.addRestStart(req.getEmployeeId(), req.getWorkDate(), req.getRestStart()) == 1;
 
-    @Query(value = """
-            select exists (
-              /* 用 atTime = COALESCE(:clockOn, :clockOff) 做檢查 */
-              select 1
-              from p01.pre_schedule ps
-              join p01.shift_work sw on sw.shift_work_id = ps.shift_work_id
-              where ps.employee_id   = :employeeId
-                and ps.apply_date    = :workDate
-                and ps.is_accept     = 1
-                and ps.shift_work_id > 0
-                and timestamp(ps.apply_date, COALESCE(:clockOn, :clockOff)) >=
-                      timestamp(ps.apply_date, sw.start_time) - interval 30 minute
-                and timestamp(ps.apply_date, COALESCE(:clockOn, :clockOff)) <
-                      case when sw.end_time > sw.start_time
-                             then timestamp(ps.apply_date, sw.end_time)
-                           else timestamp(date_add(ps.apply_date, interval 1 day), sw.end_time)
-                      end
-              union all
-              /* 連續班分支同樣把 :clockOn 換成 COALESCE(:clockOn, :clockOff) */
-              select 1
-              from p01.pre_schedule a
-              join p01.pre_schedule b
-                on a.employee_id = b.employee_id
-               and a.apply_date  = b.apply_date
-               and a.is_accept   = 1
-               and b.is_accept   = 1
-               and abs(a.shift_work_id - b.shift_work_id) = 1
-              join p01.shift_work sw1 on sw1.shift_work_id = a.shift_work_id
-              join p01.shift_work sw2 on sw2.shift_work_id = b.shift_work_id
-              where a.employee_id = :employeeId
-                and a.apply_date  = :workDate
-                and (
-                  timestamp(a.apply_date, COALESCE(:clockOn, :clockOff)) >=
-                    timestamp(a.apply_date, sw1.start_time) - interval 30 minute
-                  and timestamp(a.apply_date, COALESCE(:clockOn, :clockOff)) <
-                    case when sw1.end_time > sw1.start_time
-                           then timestamp(a.apply_date, sw1.end_time)
-                         else timestamp(date_add(a.apply_date, interval 1 day), sw1.end_time)
-                    end
-                  or
-                  timestamp(b.apply_date, COALESCE(:clockOn, :clockOff)) >=
-                    timestamp(b.apply_date, sw2.start_time) - interval 30 minute
-                  and timestamp(b.apply_date, COALESCE(:clockOn, :clockOff)) <
-                    case when sw2.end_time > sw2.start_time
-                           then timestamp(b.apply_date, sw2.end_time)
-                         else timestamp(date_add(b.apply_date, interval 1 day), sw2.end_time)
-                    end
-                )
-              limit 1
-            )
-            """, nativeQuery = true)
-    int checkAcceptPreEither(@Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("clockOn") LocalTime clockOn,
-            @Param("clockOff") LocalTime clockOff);
+        if (!row) {
+            return new ApiRes<>(400, "找不到對應的上班打卡紀錄", null);
+        }
 
-    @Query(value = """
-            select exists (
-            select 1 from p01.clock_date
-            where employee_id = :employeeId and work_date = :workDate)
-            """, nativeQuery = true)
-    public int checkExistsClockOn(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate);
+        return new ApiRes<>(200, "休息開始", null);
+    }
 
-    @Query(value = """
-            update p01.clock_date as cd
-            set cd.clock_off = :clockOff
-            where cd.employee_id = :employeeId
-            and cd.clock_date = :clockDate
-            and cd.clock_on is not null
-            and cd.clock_off is null
-            """, nativeQuery = true)
-    public int reClockOff(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("clockOff") LocalTime clockOff);
-
-    @Modifying
+    // 休息結束
     @Transactional
-    @Query(value = """
-            insert into p01.clock_date
-            (employee_id, work_date, clock_on,
-             clock_off, rest_start, rest_end,
-             total_hour, has_double, score)
-            select
-            :employeeId, :workDate, :clockOn, :clockOff,
-            :restStart, :restEnd, :totalHour,
-            case when exists (
-            select 1 from p01.holiday as h
-            where h.holiday_date = :workDate
-            and h.has_double = 1
-            and h.has_workday = 1)
-            then b'1' else b'0' end,
-            :score
-            """, nativeQuery = true)
-    public int reClockAll(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("clockOn") LocalTime clockOn,
-            @Param("clockOff") LocalTime clockOff,
-            @Param("restStart") LocalTime restStart,
-            @Param("restEnd") LocalTime restEnd,
-            @Param("totalHour") Double totalHour,
-            @Param("score") Integer score);
+    @Override
+    public ApiRes<ClockDate> addRestEnd(AddRestEndReq req) {
 
-    @Modifying
+        boolean continuous = clockDateDao.hasContinuousShift(req.getEmployeeId(), req.getWorkDate()) == 1;
+
+        if (!continuous) {
+            return new ApiRes<>(200, "非連續時段班無法休息", null);
+        }
+
+        boolean checkHasOn = clockDateDao.hasClockOn(req.getEmployeeId(), req.getWorkDate()) == 1;
+
+        if (!checkHasOn) {
+            return new ApiRes<>(400, "找不到對應的上班打卡紀錄", null);
+        }
+
+        boolean checkRestStart = clockDateDao.hasRestStart(req.getEmployeeId(), req.getWorkDate()) == 1;
+
+        if (!checkRestStart) {
+            return new ApiRes<>(400, "尚未打休息開始，請補打卡", null);
+        }
+
+        boolean hasRestEnd = clockDateDao.existsRestEnd(req.getEmployeeId(), req.getWorkDate(), req.getRestEnd()) == 1;
+
+        if (hasRestEnd) {
+            return new ApiRes<>(400, "已有休息結束紀錄", null);
+        }
+
+        boolean checkRangeOfRest = clockDateDao.canEndRest(req.getEmployeeId(),
+                req.getWorkDate(), req.getRestEnd()) == 1;
+
+        if (!checkRangeOfRest) {
+            return new ApiRes<>(400, "未在上班時段之間打卡", null);
+        }
+
+        boolean row = clockDateDao.addRestEnd(req.getEmployeeId(), req.getWorkDate(),
+                req.getRestEnd()) == 1;
+
+        if (row) {
+            return new ApiRes<>(200, "休息結束", null);
+        }
+
+        return new ApiRes<>(500, "未知錯誤", null);
+    }
+
+    // 補打卡(新增)
     @Transactional
-    @Query(value = """
-            update p01.clock_date
-            set clock_on = :clockOn,
-                clock_off = :clockOff,
-                rest_start = :restStart,
-                rest_end = :restEnd,
-                total_hour = :totalHour,
-                score = :score
-            where employee_id = :employeeId
-                and work_date = :workDate
-                and clock_on = :clockOn
-            order by clock_on desc
-            limit 1
-            """, nativeQuery = true)
-    public int reClockPart(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("clockOn") LocalTime clockOn,
-            @Param("clockOff") LocalTime clockOff,
-            @Param("restStart") LocalTime restStart,
-            @Param("restEnd") LocalTime restEnd,
-            @Param("totalHour") Double totalHour,
-            @Param("score") Integer score);
+    @Override
+    public ApiRes<ClockDate> reClockAll(ReClockReq req) {
 
-    @Query(value = """
-            select case when exists (
-              select 1
-              from p01.clock_date
-              where employee_id = :employeeId
-                and work_date   = :workDate
-                and clock_on = :clockOn
-              limit 1
-            ) then 1 else 0 end
-            """, nativeQuery = true)
-    public int checkReClockExists(
-            @Param("employeeId") String employeeId,
-            @Param("workDate") LocalDate workDate,
-            @Param("clockOn") LocalTime clockOn);
+        // 判斷打卡資訊是否完整
+        if ((req.getClockOn() == null && req.getClockOff() != null) ||
+                (req.getClockOn() != null && req.getClockOff() == null) ||
+                (req.getClockOn() == null && req.getClockOff() == null)) {
+            return new ApiRes<>(400, "請輸入完整打卡資訊", null);
+        }
+
+        // 檢查是否有排班
+        boolean hasPre = clockDateDao.checkAcceptPre(req.getEmployeeId(), req.getWorkDate(), req.getClockOn()) == 1;
+        if (!hasPre) {
+            return new ApiRes<>(400, "該時段未排班", null);
+        }
+
+        // 判斷是否有休息
+        boolean hasRest = (req.getRestStart() != null && req.getRestEnd() != null);
+
+        // 判斷非連續禁止休息
+        boolean continuous = clockDateDao.hasContinuousShift(req.getEmployeeId(), req.getWorkDate()) == 1;
+        if (!continuous && hasRest) {
+            return new ApiRes<>(200, "非連續時段班無法休息", null);
+        }
+
+        // 判斷休息資訊是否完整
+        if ((req.getRestStart() == null && req.getRestEnd() != null) ||
+                (req.getRestStart() != null && req.getRestEnd() == null)) {
+            return new ApiRes<>(400, "請輸入完整休息資訊", null);
+        }
+        // 只有有給休息才檢查休息是否在上班時段
+        if (hasRest) {
+            boolean checkRangeOfRest = clockDateDao.canStartRest(req.getEmployeeId(), req.getWorkDate(),
+                    req.getRestStart()) == 1;
+            if (!checkRangeOfRest) {
+                return new ApiRes<>(400, "休息必須在上班時段之間", null);
+            }
+
+            if (req.getRestEnd().isBefore(req.getRestStart())) {
+                return new ApiRes<>(400, "休息結束不能早於休息開始", null);
+            }
+        }
+
+        int restTime = 0;
+        if (req.getRestStart() != null && req.getRestEnd() != null) {
+            restTime = (req.getRestEnd().toSecondOfDay() - req.getRestStart().toSecondOfDay() + 86400) % 86400;
+        }
+
+        Double totalHour = Math.max(
+                0,
+                (req.getClockOff().toSecondOfDay() - req.getClockOn().toSecondOfDay() + 86400) % 86400
+                        - restTime)
+                / 3600.0;
+
+        totalHour = Math.floor(totalHour * 2.0 + 1e-9) / 2.0;
+
+        int changed = clockDateDao.reClockAll(
+                req.getEmployeeId(), req.getWorkDate(),
+                req.getClockOn(), req.getClockOff(),
+                req.getRestStart(), req.getRestEnd(),
+                totalHour,
+                req.getScore());
+
+        if (changed >= 1) {
+            return new ApiRes<>(200, "補打卡成功", null);
+        }
+        return new ApiRes<>(500, "未知錯誤", null);
+    }
+
+    // 補打卡(更新)
+    @Transactional
+    @Override
+    public ApiRes<ClockDate> reClockPart(ReClockReq req) {
+
+        // 輸入正確資訊
+        if ((req.getEmployeeId() == null && req.getWorkDate() != null) ||
+                (req.getEmployeeId() != null && req.getWorkDate() == null) ||
+                (req.getEmployeeId() == null && req.getWorkDate() == null)) {
+            return new ApiRes<>(400, "請輸入正確員工編號及補卡日期", null);
+        }
+
+        if (req.getClockOn() == null || req.getClockOff() == null) {
+            return new ApiRes<>(400, "請輸入完整打卡資訊", null);
+        }
+
+        // 檢查是否有上班打卡
+        int checkExists = clockDateDao.checkReClockExists(req.getEmployeeId(), req.getWorkDate(), req.getClockOn());
+        if (checkExists == 0) {
+            return new ApiRes<>(200, "查無該筆上班打卡紀錄，請確認上班打卡時間是否無誤，或新增(補)完整打卡資訊", null);
+        }
+
+        // 判斷是否有休息
+        boolean hasRest = (req.getRestStart() != null && req.getRestEnd() != null);
+
+        // 判斷非連續禁止休息
+        boolean continuous = clockDateDao.hasContinuousShift(req.getEmployeeId(), req.getWorkDate()) == 1;
+        if (!continuous && hasRest) {
+            return new ApiRes<>(200, "非連續時段班無法休息", null);
+        }
+
+        if ((req.getRestStart() == null && req.getRestEnd() != null) ||
+                (req.getRestStart() != null && req.getRestEnd() == null)) {
+            return new ApiRes<>(400, "請輸入完整休息資訊", null);
+        }
+
+        if (hasRest && req.getRestStart().isAfter(req.getRestEnd())) {
+            return new ApiRes<>(400, "休息結束不可早於開始", null);
+        }
+
+        // 計算時數
+        final int DAY = 86400;
+
+        int restSec = 0;
+        if (hasRest) {
+            restSec = (req.getRestEnd().toSecondOfDay() - req.getRestStart().toSecondOfDay() + DAY) % DAY;
+        }
+
+        int workSec = (req.getClockOff().toSecondOfDay() - req.getClockOn().toSecondOfDay() + DAY) % DAY;
+
+        double totalHour = Math.max(0, workSec - restSec) / 3600.0;
+        totalHour = Math.floor(totalHour * 2.0 + 1e-9) / 2.0;
+
+        if (req.getScore() == null) {
+            return new ApiRes<>(400, "score 不可為空", null);
+        }
+
+        boolean changed = clockDateDao.reClockPart(
+                req.getEmployeeId(), req.getWorkDate(),
+                req.getClockOn(), req.getClockOff(),
+                req.getRestStart(), req.getRestEnd(),
+                totalHour, req.getScore()) == 1;
+
+        if (changed) {
+            return new ApiRes<>(200, "補打卡成功", null);
+        }
+        return new ApiRes<>(500, "未知錯誤", null);
+    }
+    
 
 }
